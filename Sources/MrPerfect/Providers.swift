@@ -101,23 +101,32 @@ func fitToSelection(_ output: String, original: String) -> String {
 enum Defaults {
     static let d = UserDefaults.standard
     static var provider: Provider {
-        get { Provider(rawValue: d.string(forKey: "provider") ?? "") ?? .claude }
+        get {
+            let raw = d.string(forKey: "provider") ?? ""
+            return Provider(rawValue: raw == "gemma" ? "ollama" : raw) ?? .claude  // "gemma" was the old name
+        }
         set { d.set(newValue.rawValue, forKey: "provider") }
     }
     static var claudeModel: String { d.string(forKey: "claudeModel") ?? "claude-opus-5-5" }
-    static var gemmaModel: String { d.string(forKey: "gemmaModel") ?? "gemma4:12b" }
-    static var gemmaHost: String { d.string(forKey: "gemmaSSHHost") ?? "gpu" }
+    static var ollamaModel: String { d.string(forKey: "ollamaModel") ?? d.string(forKey: "gemmaModel") ?? "gemma4:12b" }
+    /// See `OllamaEndpoint.parse`. Older versions only knew an SSH host (`gemmaSSHHost`).
+    static var ollamaAddress: String {
+        get { d.string(forKey: "ollamaAddress") ?? d.string(forKey: "gemmaSSHHost").map { "ssh:\($0)" } ?? "" }
+        set { d.set(newValue, forKey: "ollamaAddress") }
+    }
 }
 
 enum Provider: String, CaseIterable {
-    case claude, gemma
+    case claude, ollama
 
-    var short: String { self == .claude ? "Claude" : "Gemma" }
+    var short: String { self == .claude ? "Claude" : "Ollama" }
 
     var label: String {
         switch self {
         case .claude: return "Claude · \(Defaults.claudeModel)"
-        case .gemma: return "Gemma · \(Defaults.gemmaModel) via ssh \(Defaults.gemmaHost)"
+        case .ollama:
+            let place = OllamaEndpoint.parse(Defaults.ollamaAddress)?.label ?? "invalid address"
+            return "Ollama · \(Defaults.ollamaModel) · \(place)"
         }
     }
 
@@ -125,7 +134,7 @@ enum Provider: String, CaseIterable {
     @MainActor func rewrite(_ text: String, _ action: Action, instruction: String? = nil) async throws -> String {
         switch self {
         case .claude: return try await Claude.rewrite(text, action, instruction: instruction)
-        case .gemma: return try await Gemma.rewrite(text, action, instruction: instruction)
+        case .ollama: return try await Ollama.rewrite(text, action, instruction: instruction)
         }
     }
 }
@@ -186,21 +195,66 @@ enum Claude {
     }
 }
 
-// MARK: - Gemma (Ollama on the GPU box, reached through an SSH tunnel)
+// MARK: - Ollama (this Mac, another computer on the network, or through an SSH tunnel)
+
+/// Where Ollama runs, from the one address setting:
+/// "" or "localhost" → this Mac · "192.168.1.20", "box.local:11434" or "http://…" → reached directly ·
+/// "ssh:gpu" → through an SSH tunnel to that ~/.ssh/config host (for an Ollama that only listens on its own machine).
+enum OllamaEndpoint: Equatable {
+    case direct(URL)
+    case ssh(String)
+
+    static func parse(_ address: String) -> OllamaEndpoint? {
+        let a = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        if a.isEmpty || a.lowercased() == "localhost" { return .direct(URL(string: "http://127.0.0.1:11434")!) }
+        if a.lowercased().hasPrefix("ssh:") {
+            let host = a.dropFirst(4).trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            return host.isEmpty || host.contains(" ") ? nil : .ssh(host)
+        }
+        guard var c = URLComponents(string: a.contains("://") ? a : "http://\(a)"),
+              c.scheme == "http" || c.scheme == "https", let host = c.host, !host.isEmpty, !host.contains(" ")
+        else { return nil }
+        if c.port == nil { c.port = 11434 }
+        c.path = ""
+        return c.url.map { .direct($0) }
+    }
+
+    var label: String {
+        switch self {
+        case .ssh(let host): return "ssh \(host)"
+        case .direct(let url):
+            if ["127.0.0.1", "localhost"].contains(url.host ?? "") && url.port == 11434 { return "this Mac" }
+            return url.port == 11434 ? url.host ?? url.absoluteString : "\(url.host ?? ""):\(url.port ?? 0)"
+        }
+    }
+}
 
 @MainActor
-enum Gemma {
-    static let localPort = 11435  // not 11434, so a local Ollama on the Mac doesn't collide
-    static let base = URL(string: "http://127.0.0.1:\(localPort)")!
+enum Ollama {
+    static let tunnelPort = 11435  // not 11434, so an Ollama running on this Mac doesn't collide
     static var tunnel: Process?
+    static var tunnelHost: String?
     static var tunnelErr: Pipe?
     // Must match between warm() and rewrite(): a different num_ctx makes Ollama reload the model (~12s).
     static let options = ["num_ctx": 8192]
 
+    static func endpoint() throws -> OllamaEndpoint {
+        guard let e = OllamaEndpoint.parse(Defaults.ollamaAddress) else {
+            throw AppError("The Ollama address \"\(Defaults.ollamaAddress)\" isn't valid. Menu bar icon → Set Ollama Address…")
+        }
+        return e
+    }
+
+    static func base(_ e: OllamaEndpoint) -> URL {
+        if case .direct(let url) = e { return url }
+        return URL(string: "http://127.0.0.1:\(tunnelPort)")!
+    }
+
     static func rewrite(_ text: String, _ action: Action, instruction: String?) async throws -> String {
-        try await ensureTunnel()
-        let (data, status) = try await post("api/chat", [
-            "model": Defaults.gemmaModel,
+        let e = try endpoint()
+        try await ensureReady(e)
+        let (data, status) = try await post(e, "api/chat", [
+            "model": Defaults.ollamaModel,
             "stream": false,
             "think": false,
             "keep_alive": "30m",
@@ -213,44 +267,67 @@ enum Gemma {
         return try parse(data, status: status)
     }
 
-    /// Opens the tunnel and loads the model while the user is still choosing an action.
+    /// Connects and loads the model while the user is still choosing an action.
     static func warm() async {
-        guard (try? await ensureTunnel()) != nil else { return }
-        _ = try? await post("api/generate", ["model": Defaults.gemmaModel, "keep_alive": "30m", "options": options], timeout: 120)
+        guard let e = try? endpoint(), (try? await ensureReady(e)) != nil else { return }
+        _ = try? await post(e, "api/generate", ["model": Defaults.ollamaModel, "keep_alive": "30m", "options": options], timeout: 120)
+    }
+
+    /// Called when the address changes, so an old tunnel can't answer for the new address.
+    static func reset() {
+        tunnel?.terminate()
+        tunnel = nil
+        tunnelHost = nil
     }
 
     nonisolated static func parse(_ data: Data, status: Int) throws -> String {
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         guard status == 200 else {
-            throw AppError("Ollama error (\(status)): \(json["error"] as? String ?? "unknown")")
+            let msg = json["error"] as? String ?? "unknown"
+            let hint = status == 404 ? " Pull it first with `ollama pull \(Defaults.ollamaModel)`." : ""
+            throw AppError("Ollama error (\(status)): \(msg).\(hint)")
         }
         let text = (json["message"] as? [String: Any])?["content"] as? String ?? ""
-        guard !text.isEmpty else { throw AppError("Gemma returned no text.") }
+        guard !text.isEmpty else { throw AppError("Ollama returned no text.") }
         return text
     }
 
-    static func post(_ path: String, _ body: [String: Any], timeout: TimeInterval) async throws -> (Data, Int) {
-        var req = URLRequest(url: base.appending(path: path), timeoutInterval: timeout)
+    static func post(_ e: OllamaEndpoint, _ path: String, _ body: [String: Any], timeout: TimeInterval) async throws -> (Data, Int) {
+        var req = URLRequest(url: base(e).appending(path: path), timeoutInterval: timeout)
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
     }
 
-    static func reachable() async -> Bool {
-        let req = URLRequest(url: base.appending(path: "api/version"), timeoutInterval: 1)
+    static func reachable(_ url: URL, timeout: TimeInterval = 1) async -> Bool {
+        let req = URLRequest(url: url.appending(path: "api/version"), timeoutInterval: timeout)
         return (try? await URLSession.shared.data(for: req)) != nil
     }
 
-    static func ensureTunnel() async throws {
-        if await reachable() { return }
-        let host = Defaults.gemmaHost
+    static func ensureReady(_ e: OllamaEndpoint) async throws {
+        switch e {
+        case .ssh(let host): try await ensureTunnel(host)
+        case .direct(let url):
+            if await reachable(url, timeout: 3) { return }
+            let onThisMac = ["127.0.0.1", "localhost"].contains(url.host ?? "")
+            if !onThisMac, let host = url.host { try await checkLocalNetwork(host, port: UInt16(url.port ?? 11434)) }
+            throw AppError(onThisMac
+                ? "Ollama isn't running on this Mac. Start it (open the Ollama app, or run `ollama serve`), or set another address from the menu bar."
+                : "Can't reach Ollama at \(e.label). Check that it's running there and listening on the network (OLLAMA_HOST=0.0.0.0), or use ssh:<host> instead.")
+        }
+    }
+
+    static func ensureTunnel(_ host: String) async throws {
+        let local = base(.ssh(host))
+        if tunnelHost == host, await reachable(local) { return }
+        if tunnelHost != host { reset() }
         if tunnel?.isRunning != true {
-            try await checkLocalNetwork(host)
+            if let ip = sshHostname(host) { try await checkLocalNetwork(ip, port: 22) }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
             p.arguments = ["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
-                           "-o", "ServerAliveInterval=30", "-L", "\(localPort):127.0.0.1:11434", host]
+                           "-o", "ServerAliveInterval=30", "-L", "\(tunnelPort):127.0.0.1:11434", host]
             // GUI apps get a bare PATH; an ssh config `Match exec` (e.g. a Wake-on-LAN step) may need Homebrew tools.
             var env = ProcessInfo.processInfo.environment
             env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -259,14 +336,15 @@ enum Gemma {
             p.standardError = err
             try p.run()
             tunnel = p
+            tunnelHost = host
             tunnelErr = err
         }
-        // ponytail: 150s covers a Wake-on-LAN boot plus sshd; shorten if the box never sleeps
+        // ponytail: 150s covers a Wake-on-LAN boot plus sshd; shorten if the machine never sleeps
         for _ in 0..<300 {
-            if await reachable() { return }
+            if await reachable(local) { return }
             if tunnel?.isRunning != true {
                 let msg = tunnelErr.flatMap { String(data: $0.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) } ?? ""
-                tunnel = nil
+                reset()
                 throw AppError("SSH tunnel to '\(host)' failed: \(msg.trimmingCharacters(in: .whitespacesAndNewlines))")
             }
             try await Task.sleep(for: .milliseconds(500))
@@ -274,11 +352,11 @@ enum Gemma {
         throw AppError("Timed out reaching Ollama through ssh \(host).")
     }
 
-    /// macOS silently blocks child processes (ssh) from the LAN until the app itself has Local Network access.
-    /// Connecting from the app makes macOS ask, and tells us right away if access was denied.
-    static func checkLocalNetwork(_ host: String) async throws {
-        guard let ip = sshHostname(host) else { return }
-        let conn = NWConnection(host: NWEndpoint.Host(ip), port: 22, using: .tcp)
+    /// macOS blocks LAN access (silently, for child processes like ssh) until the app itself has Local Network
+    /// access. Connecting from the app makes macOS ask, and tells us right away if access was denied.
+    static func checkLocalNetwork(_ host: String, port: UInt16) async throws {
+        guard let p = NWEndpoint.Port(rawValue: port) else { return }
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: p, using: .tcp)
         let denied = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             var done = false
             func finish(_ denied: Bool) {
@@ -294,7 +372,7 @@ enum Gemma {
                 }
             }
             conn.start(queue: .main)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }  // asleep box: let ssh wake it
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }  // asleep machine: let ssh wake it
         }
         conn.cancel()
         if denied {

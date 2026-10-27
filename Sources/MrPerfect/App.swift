@@ -33,7 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
     }
 
-    func applicationWillTerminate(_: Notification) { Gemma.tunnel?.terminate() }
+    func applicationWillTerminate(_: Notification) { Ollama.reset() }
 
     /// Menu-bar-only apps have no main menu, and without one ⌘C/⌘V/⌘A/⌘Z do nothing in text fields.
     func editMenu() -> NSMenu {
@@ -63,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         menu.addItem(.separator())
         menu.addItem(item(Keychain.apiKey == nil ? "Set Claude API Key…" : "Replace Claude API Key…", #selector(setKey)))
+        menu.addItem(item("Set Ollama Address…", #selector(setOllamaAddress)))
         if Keychain.apiKey != nil { menu.addItem(item("Remove Claude API Key", #selector(removeKey))) }
         let button = item("Show Button on Selection", #selector(toggleSelectionButton))
         button.state = SelectionButton.enabled ? .on : .off
@@ -100,6 +101,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func setKey() {
         let s = Session(original: "", source: nil)
         s.stage = .askKey
+        show(s)
+    }
+
+    @objc func setOllamaAddress() {
+        let s = Session(original: "", source: nil)
+        s.addressInput = Defaults.ollamaAddress
+        s.stage = .askAddress
         show(s)
     }
 
@@ -152,7 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         p.makeKeyAndOrderFront(nil)
         panel = p
         session = s
-        if Defaults.provider == .gemma, s.source != nil { Task { await Gemma.warm() } }
+        if Defaults.provider == .ollama, s.source != nil { Task { await Ollama.warm() } }
     }
 
     // Click anywhere else and the panel goes away, without touching the selection.
@@ -204,10 +212,12 @@ enum Hotkey {
 
 @MainActor @Observable
 final class Session {
-    enum Stage: Equatable { case pick, instruct, working, result, failed(String), askKey }
+    enum Stage: Equatable { case pick, instruct, working, result, failed(String), askKey, askAddress }
     var stage: Stage = .pick
     var revised = ""
     var keyInput = ""
+    var addressInput = ""
+    var addressError: String?
     var instruction = ""  // what the user typed for "Modify with instructions"
     var last: Action?
     let original: String
@@ -264,6 +274,17 @@ final class Session {
         keyInput = ""
         if status == errSecSuccess { return close() }
         stage = .failed("Couldn't save the key to the Keychain: \(SecCopyErrorMessageString(status, nil) as String? ?? "error \(status)")")
+    }
+
+    func saveAddress() {
+        let address = addressInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard OllamaEndpoint.parse(address) != nil else {
+            addressError = "Not an address MrPerfect understands. Use one of the forms above."
+            return
+        }
+        Defaults.ollamaAddress = address
+        Ollama.reset()
+        close()
     }
 
     func copy() {
@@ -414,6 +435,31 @@ struct PanelView: View {
             }
             .padding(10)
             .frame(width: 320)
+        case .askAddress:
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Where does Ollama run?").font(.callout)
+                TextField("Leave empty for this Mac", text: $s.addressInput)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($keyFocused)
+                    .onAppear { keyFocused = true }
+                    .onSubmit { s.saveAddress() }
+                Grid(alignment: .leading, verticalSpacing: 2) {
+                    GridRow { Text("empty").monospaced(); Text("Ollama on this Mac") }
+                    GridRow { Text("192.168.1.20").monospaced(); Text("another computer on your network") }
+                    GridRow { Text("ssh:gpu").monospaced(); Text("through an SSH host alias") }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                if let e = s.addressError { Text(e).font(.caption).foregroundStyle(.red) }
+                HStack {
+                    Text("Model: \(Defaults.ollamaModel)").font(.caption2).foregroundStyle(.tertiary)
+                    Spacer()
+                    Button("Cancel") { s.cancel() }
+                    Button("Save") { s.saveAddress() }.keyboardShortcut(.defaultAction)
+                }
+                .controlSize(.small)
+            }
+            .padding(10)
+            .frame(width: 340)
         case .failed(let message):
             VStack(alignment: .leading, spacing: 8) {
                 Text(message).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)

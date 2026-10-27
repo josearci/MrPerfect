@@ -21,9 +21,9 @@ final class MrPerfectTests: XCTestCase {
         }
     }
 
-    func testGemmaParse() throws {
-        XCTAssertEqual(try Gemma.parse(Data(#"{"message":{"role":"assistant","content":"Ok."}}"#.utf8), status: 200), "Ok.")
-        XCTAssertThrowsError(try Gemma.parse(Data(#"{"error":"model 'x' not found"}"#.utf8), status: 404))
+    func testOllamaParse() throws {
+        XCTAssertEqual(try Ollama.parse(Data(#"{"message":{"role":"assistant","content":"Ok."}}"#.utf8), status: 200), "Ok.")
+        XCTAssertThrowsError(try Ollama.parse(Data(#"{"error":"model 'x' not found"}"#.utf8), status: 404))
     }
 
     func testSelectionButtonSitsLeftOfFirstCharacter() {
@@ -62,6 +62,23 @@ final class MrPerfectTests: XCTestCase {
         XCTAssertEqual(SelectionButton.guessedFrame(down: NSPoint(x: 200, y: 300), up: NSPoint(x: 200, y: 300), clicks: 2),
                        NSRect(x: 190, y: 270, width: 20, height: 20))
         XCTAssertNil(SelectionButton.guessedFrame(down: NSPoint(x: 200, y: 300), up: NSPoint(x: 203, y: 300), clicks: 1))
+    }
+
+    func testOllamaAddressForms() {
+        let mac = URL(string: "http://127.0.0.1:11434")!
+        XCTAssertEqual(OllamaEndpoint.parse(""), .direct(mac))
+        XCTAssertEqual(OllamaEndpoint.parse("  localhost "), .direct(mac))
+        XCTAssertEqual(OllamaEndpoint.parse("192.168.1.20"), .direct(URL(string: "http://192.168.1.20:11434")!))
+        XCTAssertEqual(OllamaEndpoint.parse("box.local:8080"), .direct(URL(string: "http://box.local:8080")!))
+        XCTAssertEqual(OllamaEndpoint.parse("https://ollama.example.com/"), .direct(URL(string: "https://ollama.example.com:11434")!))
+        XCTAssertEqual(OllamaEndpoint.parse("ssh:gpu"), .ssh("gpu"))
+        XCTAssertEqual(OllamaEndpoint.parse("ssh://gpu"), .ssh("gpu"))
+        XCTAssertNil(OllamaEndpoint.parse("ssh:"))
+        XCTAssertNil(OllamaEndpoint.parse("ftp://box"))
+        XCTAssertNil(OllamaEndpoint.parse("not an address"))
+        XCTAssertEqual(OllamaEndpoint.parse("")?.label, "this Mac")
+        XCTAssertEqual(OllamaEndpoint.parse("192.168.1.20")?.label, "192.168.1.20")
+        XCTAssertEqual(OllamaEndpoint.parse("ssh:gpu")?.label, "ssh gpu")
     }
 
     func testMenuOrderIsFixed() {

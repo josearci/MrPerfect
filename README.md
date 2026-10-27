@@ -6,7 +6,7 @@ A menu bar app for macOS. Select text in any app, then click the small round but
 ⌃⌥R ─▶ read selection ─▶ menu: ↩ Improve prompt · 2 Improve message · 3 Translate · 4 Modify
         (Accessibility,            │
          ⌘C fallback)              ▼
-                         Claude API  or  Gemma (Ollama on `gpu`, via SSH tunnel)
+                  Claude API  or  Ollama (this Mac, your network, or an SSH tunnel)
                                    │
                                    ▼
                   editable result ─▶ ⌘↩ Replace (re-checks selection, pastes)
@@ -15,7 +15,7 @@ A menu bar app for macOS. Select text in any app, then click the small round but
 
 ## Setup
 
-Requirements: macOS 14+, Xcode (for `swift`), and at least one provider: a Claude API key, or a machine running [Ollama](https://ollama.com) with a Gemma model that you can reach over SSH.
+Requirements: macOS 14+, Xcode (for `swift`), and at least one provider: a Claude API key, or [Ollama](https://ollama.com) with a model pulled (`ollama pull gemma4:12b`), on this Mac or on another computer you can reach.
 
 ```bash
 ./build.sh
@@ -25,7 +25,7 @@ This builds a release binary, wraps it in `~/Applications/MrPerfect.app`, signs 
 
 1. **Accessibility:** macOS asks the first time. Open System Settings → Privacy & Security → Accessibility and turn on MrPerfect. If the panel says it still needs access, quit the app and open it again.
 2. **Claude key:** click the menu bar icon (✨ wand) → *Set Claude API Key…*. The key goes into your login Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`). It is never written to disk in plain text or included in iCloud sync.
-3. **Provider:** use the menu bar icon to choose between *Use Claude* and *Use Gemma*. The choice applies to the next ⌃⌥R.
+3. **Provider:** use the menu bar icon to choose between *Use Claude* and *Use Ollama*. For Ollama, *Set Ollama Address…* says where it runs (see below). The choice applies to the next action.
 4. Optional: *Launch at Login* in the same menu.
 
 Run the tests with `swift test`.
@@ -35,8 +35,8 @@ Run the tests with `swift test`.
 | key | default | notes |
 |---|---|---|
 | `claudeModel` | `claude-opus-5-5` | `claude-haiku-5-5` is faster and far cheaper; `claude-sonnet-5-5` is in between |
-| `gemmaModel` | `gemma4:12b` | fits fully in a 12 GB GPU; `gemma4:26b` didn't and was far slower in testing |
-| `gemmaSSHHost` | `gpu` | the `~/.ssh/config` host alias of the machine running Ollama |
+| `ollamaModel` | `gemma4:12b` | any model you've pulled; `gemma4:12b` fits fully in a 12 GB GPU, `gemma4:26b` didn't and was far slower |
+| `ollamaAddress` | *(empty: this Mac)* | also settable from the menu: *Set Ollama Address…* (see Ollama below) |
 
 ## Translate
 
@@ -51,17 +51,22 @@ Press **4** and type what you want changed, for example "more formal", "add that
 ### Claude API
 The app sends a direct `POST https://api.anthropic.com/v1/messages` request with `anthropic-version: 2026-10-21` and `output_config.effort: "low"` (a rewrite doesn't need deep reasoning, and low effort keeps latency down). It also sends `fallbacks: "default"`, so a safety-classifier false positive is retried on a fallback model on Anthropic's side instead of failing. Haiku doesn't accept that field, so it's left out for Haiku. Text you rewrite with Claude goes to Anthropic.
 
-### Gemma over SSH
-Gemma runs under Ollama on another machine, reached through an SSH host alias (`gpu` by default). **Plain SSH access isn't enough by itself:** Ollama listens only on `127.0.0.1:11434` by default, so the Mac can't reach it directly. The app handles this itself:
+### Ollama
+Set where Ollama runs with *Set Ollama Address…* in the menu bar:
 
-- On the first Gemma request it starts `ssh -N -L 11435:127.0.0.1:11434 gpu`, a background SSH tunnel that forwards a port on the Mac to Ollama on the box. If your SSH config wakes the machine first (for example a `Match exec` that sends Wake-on-LAN), the app waits up to 150 s for it. The tunnel is stopped when the app quits and restarted if it drops.
-- When the panel opens with Gemma selected, the app opens the tunnel and loads the model while you're still choosing an action. With the model loaded, a rewrite took **0.5–2 s**. Loading it from scratch takes ~12 s, and Ollama keeps it loaded for 30 min.
-- It uses `BatchMode=yes`, so your SSH key has to work without a password prompt (check with `ssh -o BatchMode=yes gpu true`).
-- macOS asks once for **Local Network** access for MrPerfect; allow it, or the tunnel can't reach the machine.
+| Address | Where Ollama runs | What to set up there |
+|---|---|---|
+| *(empty)* | this Mac | open the Ollama app, or run `ollama serve` |
+| `192.168.1.20`, `box.local` or `http://host:port` | another computer on your network, reached directly | make Ollama listen on the network: `OLLAMA_HOST=0.0.0.0` |
+| `ssh:gpu` | another computer, through an SSH tunnel to that `~/.ssh/config` host | nothing: Ollama can keep listening only on its own machine |
 
-Why a tunnel rather than `OLLAMA_HOST=0.0.0.0` on the GPU machine: Ollama has no authentication, so binding it to the LAN lets any device on your network use it. The tunnel is encrypted and authenticated with your existing SSH key, and nothing changes on the box. Text sent to Gemma stays on your LAN.
+- **Direct (network address):** simplest, but Ollama has no authentication, so anything on your network can use it. Port 11434 is assumed when you leave it out.
+- **SSH tunnel:** on the first request the app starts `ssh -N -L 11435:127.0.0.1:11434 <host>`, which forwards a port on the Mac to Ollama on that machine, encrypted and authenticated with your SSH key. It uses `BatchMode=yes`, so the key must work without a password prompt (check with `ssh -o BatchMode=yes <host> true`). If your SSH config wakes the machine first (for example a `Match exec` that sends Wake-on-LAN), the app waits up to 150 s. The tunnel closes when the app quits and restarts if it drops.
+- **Another computer, either way:** macOS asks once for **Local Network** access for MrPerfect; allow it.
+- **Speed:** when the panel opens with Ollama selected, the app connects and loads the model while you're still choosing an action. With the model loaded, a rewrite took **0.5–2 s** in testing; loading it from scratch takes ~12 s, and Ollama keeps it loaded for 30 min.
+- **Privacy:** text sent to Ollama stays on your Mac or your network.
 
-Optional, on the GPU machine: `sudo systemctl edit ollama` → `Environment="OLLAMA_KEEP_ALIVE=24h"` keeps the model loaded longer.
+Optional, on the Ollama machine (Linux): `sudo systemctl edit ollama` → `Environment="OLLAMA_KEEP_ALIVE=24h"` keeps the model loaded longer.
 
 ## Architecture choices
 
@@ -72,7 +77,7 @@ Optional, on the GPU machine: `sudo systemctl edit ollama` → `Environment="OLL
 | Reading the selection | Accessibility `kAXSelectedTextAttribute` first, simulated ⌘C as a fallback | AX works in native apps without touching the clipboard. Chrome and Electron apps often don't expose it over AX, so they need ⌘C. |
 | Replacing | Re-read the selection, and if it still matches, paste with ⌘V, then restore your clipboard after 1 s | Writing through AX silently does nothing in many apps. Pasting works everywhere. The re-check ensures it never pastes over text you didn't approve. |
 | Panel | Non-activating floating `NSPanel` | Keystrokes go to the panel but the source app stays active, so its selection is still there when you press Replace. |
-| Credentials | Keychain for the Claude key; your SSH key for Gemma | No plain-text secrets anywhere. |
+| Credentials | Keychain for the Claude key; your SSH key for an Ollama tunnel | No plain-text secrets anywhere. |
 | Sandbox | None (not possible) | The App Sandbox blocks Accessibility control of other apps and starting `ssh`. This means no Mac App Store. |
 
 ### Privacy and safety
@@ -91,12 +96,12 @@ Optional, on the GPU machine: `sudo systemctl edit ollama` → `Environment="OLL
 
 ## Phased plan
 
-1. **Phase 1 (done):** hotkey and selection button → four actions → editable review → Replace/Copy. Claude and Gemma, switching from the menu bar, Keychain, the SSH tunnel with model pre-loading, launch at login, unit tests for parsing and output cleanup.
+1. **Phase 1 (done):** hotkey and selection button → four actions → editable review → Replace/Copy. Claude and Ollama, switching from the menu bar, Keychain, the SSH tunnel with model pre-loading, launch at login, unit tests for parsing and output cleanup.
 2. **Phase 2, daily-driver polish:** stream tokens into the editor (lower perceived latency on Claude). Show a word-level diff of the original and the rewrite. A settings window with a hotkey recorder and model fields. Saved custom actions (a name plus a system prompt).
 3. **Phase 3, smarter triggering:** the selection button is done, including read-only text and apps that hide their text. Still to do: a Services-menu entry, and the panel position on web pages.
-4. **Phase 4, robustness and distribution:** fall back to the other provider when the GPU box is unreachable (with a visible notice, since the privacy level changes). Retry with backoff on 429/529. Notarize with a Developer ID for use on other Macs. Auto-update (Sparkle).
+4. **Phase 4, robustness and distribution:** fall back to the other provider when Ollama is unreachable (with a visible notice, since the privacy level changes). Retry with backoff on 429/529. Notarize with a Developer ID for use on other Macs. Auto-update (Sparkle).
 
 ## Assumptions
 - macOS 14+ on Apple Silicon. Built for personal use: you build it yourself, with no notarization or App Store.
-- The Gemma machine is on your local network. Away from it, Gemma is unreachable unless you add Tailscale or a VPN and point `gemmaSSHHost` at it.
+- An Ollama machine other than this Mac is on your local network. Away from it, it's unreachable unless you add Tailscale or a VPN and point the Ollama address at it.
 - Defaulting to Opus 5.5 at low effort favours quality. If latency or cost matters more to you, switch to `claude-haiku-5-5`.
